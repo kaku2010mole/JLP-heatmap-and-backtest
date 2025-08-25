@@ -42,27 +42,27 @@ Factors here can be adjusted.
 
 test heatmap.py
 
-# The absolute adjustment percentage to apply when a boost is triggered.
-# For example, a value of 0.5 means a ±50% change to the current ratio depending on direction.
+The absolute adjustment percentage to apply when a boost is triggered.
+For example, a value of 0.5 means a ±50% change to the current ratio depending on direction.
 boost_pct_abs = 0.5
 
-# Boosting is triggered when either the upper or lower accumulated SOL liquidation volume exceeds 200.
-# This serves as a threshold to determine whether there's significant liquidation pressure.
+Boosting is triggered when either the upper or lower accumulated SOL liquidation volume exceeds 200.
+This serves as a threshold to determine whether there's significant liquidation pressure.
 trigger = (sol_sum_upper > 200 or sol_sum_lower > 200)
 
-# Start applying boost logic only if:
-# - it hasn't already been applied, and
-# - a sufficient number of confirmation intervals (confirm >= 1) have passed since the trigger condition.
+Start applying boost logic only if:
+- it hasn't already been applied, and
+- a sufficient number of confirmation intervals (confirm >= 1) have passed since the trigger condition.
 if not boost_applied and confirm >= 1:
     boost_applied = True
-    # Determine direction of the boost:
-    #   +1 if lower liquidation pressure is stronger (buy side support),
-    #   -1 if upper liquidation pressure is stronger (sell side resistance).
+    Determine direction of the boost:
+    +1 if lower liquidation pressure is stronger (buy side support),
+    -1 if upper liquidation pressure is stronger (sell side resistance).
     direction = 1 if sol_sum_lower > sol_sum_upper else -1
     boost_toggle_points.append((df["timestamp"].iloc[i], "on"))
 
-# Stop applying boost if enough "release" confirmations (release >= 5) have accumulated
-# indicating that the pressure has eased or normalized.
+Stop applying boost if enough "release" confirmations (release >= 5) have accumulated
+indicating that the pressure has eased or normalized.
 if boost_applied and release >= 5:
     boost_applied = False
     direction = 0  # Neutralize adjustment
