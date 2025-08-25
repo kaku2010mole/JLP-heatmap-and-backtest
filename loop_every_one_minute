@@ -1,0 +1,119 @@
+import fs from "fs";
+import path from "path";
+import { exec } from "child_process";
+
+const OUT_DIR = path.resolve("data-sol_snapshots");
+const MERGED_FILE = path.join(OUT_DIR, "sol_positions_log.csv");
+const MARK_FILE = path.join(OUT_DIR, ".last_snapshot"); // 记录上次处理到的文件名
+const SNAPSHOT_RE = /^sol_positions_(\d{8})T(\d{4})Z\.csv$/; // 仅时间戳快照
+
+fs.mkdirSync(OUT_DIR, { recursive: true });
+
+// 确保合并文件有表头
+function ensureHeader() {
+  if (!fs.existsSync(MERGED_FILE) || fs.statSync(MERGED_FILE).size === 0) {
+    fs.writeFileSync(MERGED_FILE, "liq_price,size_sol,t_bin\n");
+  }
+}
+
+// 解析 t_bin：从快照文件名生成 "YYYY-MM-DDTHH:MM:00Z"
+function tbinFromFilename(fname) {
+  const m = fname.match(SNAPSHOT_RE);
+  if (!m) return null;
+  const yyyymmdd = m[1]; // 8位
+  const hhmm = m[2];     // 4位
+  const YYYY = yyyymmdd.slice(0, 4);
+  const MM = yyyymmdd.slice(4, 6);
+  const DD = yyyymmdd.slice(6, 8);
+  const HH = hhmm.slice(0, 2);
+  const mm = hhmm.slice(2, 4);
+  return `${YYYY}-${MM}-${DD}T${HH}:${mm}:00Z`;
+}
+
+// 读取上次处理到的文件名
+function readMark() {
+  try {
+    if (fs.existsSync(MARK_FILE)) {
+      return fs.readFileSync(MARK_FILE, "utf-8").trim();
+    }
+  } catch {}
+  return "";
+}
+
+// 写入标记
+function writeMark(fname) {
+  try {
+    fs.writeFileSync(MARK_FILE, fname);
+  } catch {}
+}
+
+function runOnce() {
+  // 先执行主导出脚本（它会在 OUT_DIR 里生成一个新的快照文件）
+  exec("node fetch_onchain_SOL_custody_data.mjs", (err, stdout, stderr) => {
+    if (err) {
+      console.error("运行出错：", err);
+      return;
+    }
+    if (stdout) console.log(stdout.trim());
+    if (stderr) console.error(stderr.trim());
+
+    // 找到所有符合快照命名的文件（排除合并文件）
+    const files = fs.readdirSync(OUT_DIR)
+      .filter(f => SNAPSHOT_RE.test(f) && f !== path.basename(MERGED_FILE));
+
+    if (files.length === 0) return;
+
+    // 按文件名排序（同时间序），只处理「比上次标记更新的」文件
+    const last = readMark();
+    const pending = files
+      .sort()                 // 字典序即时间序：YYYYMMDDTHHMMZ
+      .filter(f => f > last); // 只处理新快照
+
+    if (pending.length === 0) return;
+
+    ensureHeader();
+
+    for (const fname of pending) {
+      const fullPath = path.join(OUT_DIR, fname);
+
+      // 读快照，跳过 header，并为每行追加 t_bin（来自文件名）
+      let text = fs.readFileSync(fullPath, "utf-8").trim();
+      if (!text) { fs.unlinkSync(fullPath); writeMark(fname); continue; }
+
+      const lines = text.split("\n");
+      const header = lines[0].toLowerCase().replace(/\s+/g, "");
+      // 允许快照文件是 "liq_price,size_sol" 或包含更多列（只取前两列）
+      const body = lines.slice(1).filter(Boolean);
+      const tbin = tbinFromFilename(fname);
+      if (!tbin) { console.warn(`⚠ 无法解析 t_bin: ${fname}`); fs.unlinkSync(fullPath); writeMark(fname); continue; }
+
+      // 只取前两列（liq_price,size_sol），并追加 t_bin
+      const rowsToWrite = body.map(line => {
+        const cols = line.split(","); // 快照就是两列的话正好
+        const liq = cols[0]?.trim();
+        const sz  = cols[1]?.trim();
+        return `${liq},${sz},${tbin}`;
+      }).filter(r => r && !r.startsWith(","));
+
+      if (rowsToWrite.length > 0) {
+        fs.appendFileSync(MERGED_FILE, rowsToWrite.join("\n") + "\n");
+        console.log(`✅ 追加 ${rowsToWrite.length} 行 → ${MERGED_FILE}`);
+      } else {
+        console.log(`ℹ️ ${fname} 无有效行，已跳过`);
+      }
+
+      // 删除已处理的快照，并更新标记
+      try { fs.unlinkSync(fullPath); } catch {}
+      writeMark(fname);
+    }
+  });
+}
+
+// 立即执行一次
+runOnce();
+
+// 每 1 分钟执行一次
+setInterval(runOnce, 60 * 1000);
+
+
+
