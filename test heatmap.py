@@ -16,7 +16,9 @@ df = df.rename(columns={
 for col in ["sol_pos", "target_pct", "current_pct", "sol_price", "jlp_amt", "jlp_price"]:
     df[col] = df[col].astype(str).str.replace(",", "").astype(float)
 
-df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize("UTC")
+# 将 HKT 转为 UTC（CSV 是 HKT 时间）
+df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize("Asia/Hong_Kong").dt.tz_convert("UTC")
+
 df["price_diff"] = df["sol_price"].diff()
 
 # === Load heatmap NPZ ===
@@ -24,13 +26,14 @@ data = np.load("/Users/posley3302_15/Desktop/JLP_heatmap_v2/liq_matrix_72h_1m.np
 Z = data["Z"]  # shape [price_bins, time_steps]
 price_bins = data["y_edges"][:-1]  # [500] price intervals (y-axis)
 
-# === Boost control (tracking actual position) ===
+# === Boost control (tracking actual position) with reversal during cooldown ===
 boost_pct_abs = 0.5
 boosted_actual_pct = []
 boost_applied = False
 confirm = 0
 release = 0
 direction = 0
+cooldown_threshold = 2
 boost_toggle_points = []
 
 for i in range(len(df)):
@@ -42,33 +45,45 @@ for i in range(len(df)):
         continue
 
     cur_price = df.loc[i, "sol_price"]
-    mask_upper = (price_bins > cur_price) & (price_bins <= cur_price + 0.3)
-    mask_lower = (price_bins >= cur_price - 0.3) & (price_bins < cur_price)
+    mask_upper = (price_bins > cur_price) & (price_bins <= cur_price + 10)
+    mask_lower = (price_bins >= cur_price - 10) & (price_bins < cur_price)
 
     usd_sum_upper = Z[mask_upper, i].sum()
     usd_sum_lower = Z[mask_lower, i].sum()
     sol_sum_upper = usd_sum_upper / cur_price
     sol_sum_lower = usd_sum_lower / cur_price
 
-    trigger = (sol_sum_upper > 100 or sol_sum_lower > 100)
+    trigger = (sol_sum_upper > 500 or sol_sum_lower > 500)
+    new_direction = 1 if sol_sum_lower > sol_sum_upper else -1
 
     if trigger:
         confirm += 1
-        release = 0
+        # 冷静期内遇到反方向信号，立即中断冷静并反转
+        if boost_applied and release > 0 and new_direction != direction:
+            print(f"[{df['timestamp'].iloc[i]}] Reversing during cooldown: {direction} → {new_direction}")
+            direction = new_direction
+            release = 0
+            confirm = 1
+            boost_toggle_points.append((df["timestamp"].iloc[i], "reverse"))
+        else:
+            release = 0
     else:
         confirm = 0
         release += 1
 
+    # 启动 boost
     if not boost_applied and confirm >= 1:
         boost_applied = True
-        direction = 1 if sol_sum_lower > sol_sum_upper else -1
+        direction = new_direction
         boost_toggle_points.append((df["timestamp"].iloc[i], "on"))
 
-    if boost_applied and release >= 10:
+    # 冷静期结束，取消 boost
+    if boost_applied and release >= cooldown_threshold:
         boost_applied = False
         direction = 0
         boost_toggle_points.append((df["timestamp"].iloc[i], "off"))
 
+    # 应用 boost
     if boost_applied:
         boosted += direction * boost_pct_abs
 
@@ -109,7 +124,8 @@ ax2.plot(df["timestamp"], df["sol_price"], label="SOL Price", color="tab:red", a
 ax2.set_ylabel("SOL Price (USD)")
 
 for ts, status in boost_toggle_points:
-    ax1.axvline(x=ts, color="gray", linestyle="dotted", alpha=0.5)
+    color = {"on": "green", "off": "red", "reverse": "purple"}.get(status, "gray")
+    ax1.axvline(x=ts, color=color, linestyle="dotted", alpha=0.6)
 
 lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
@@ -124,7 +140,7 @@ plt.show()
 # === Plot 2: Delta Loss Comparison ===
 plt.figure(figsize=(14, 5))
 plt.plot(df["timestamp"], df["cumulative_delta_loss_raw"], label="No Boost", color="tab:gray")
-plt.plot(df["timestamp"], df["cumulative_delta_loss_boosted"], label="Directional Boost", color="tab:red", linestyle="--")
+plt.plot(df["timestamp"], df["cumulative_delta_loss_boosted"], label="Directional Boost (w/ reversal)", color="tab:red", linestyle="--")
 plt.ylabel("Cumulative Delta Loss (USD)")
 plt.xlabel("Time")
 plt.title("Cumulative Delta Loss: With vs Without Directional Boost")
@@ -133,3 +149,4 @@ plt.legend()
 plt.xticks(rotation=30)
 plt.tight_layout()
 plt.show()
+
