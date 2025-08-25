@@ -1,0 +1,158 @@
+import { Connection, PublicKey } from "@solana/web3.js";
+import bs58 from "bs58";
+import crypto from "crypto";
+import fs from "fs";
+import fetch from "node-fetch";
+
+// ========= 配置 =========
+const RPC = process.env.SOLANA_RPC_URL || "https://mainnet.helius-rpc.com/?api-key=aaa13939-db54-40a2-ab9d-29913649d553";
+const PROGRAM_ID = new PublicKey("PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu");
+const SOL_CUSTODY = new PublicKey("7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz");
+
+const USD_PREC = 1e6;
+const MMR_DEFAULT = 0.002;
+const CLOSE_FEE_RATE = 0.0006;
+const LIMIT = 0;
+const DISABLE_CUSTODY_FILTER = false;
+const FORCE_LONG_IS_ONE = process.env.FORCE_LONG_IS_ONE;
+
+function discriminator(name) {
+  return crypto.createHash("sha256").update(Buffer.from(`account:${name}`)).digest().subarray(0, 8);
+}
+const OFF = {
+  side: 152,
+  price: 153,
+  sizeUsd: 161,
+  collateralUsd: 169,
+};
+const RECORD_LEN = 210;
+const U64 = (buf, off) => Number(buf.readBigUInt64LE(off));
+
+function calcLiq({ isLong, entry, sizeUsd, collUsd, mmr = MMR_DEFAULT, borrowFeeUsd = 0 }) {
+  if (!(entry > 0) || !(sizeUsd > 0)) return NaN;
+  const closeFeeUsd = sizeUsd * CLOSE_FEE_RATE;
+  const effColl = collUsd - borrowFeeUsd - closeFeeUsd;
+  if (isLong) return entry * (1 + mmr - (effColl / sizeUsd));
+  return entry * (1 - mmr + (effColl / sizeUsd));
+}
+
+async function fetchSpot() {
+  const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT", { timeout: 8000 });
+  const j = await r.json();
+  const p = parseFloat(j.price);
+  if (!Number.isFinite(p)) throw new Error("failed to fetch spot");
+  return p;
+}
+
+function autodetectWithSpot(samples, spot) {
+  const score = (longIsOne) => {
+    let ok = 0, total = 0;
+    for (const s of samples) {
+      const isLong = longIsOne ? (s.sideByte === 1) : (s.sideByte === 0);
+      const liq = calcLiq({ isLong, entry: s.entry, sizeUsd: s.sizeUsd, collUsd: s.collUsd });
+      if (!Number.isFinite(liq) || liq <= 0) continue;
+      if (isLong && liq <= spot) ok++;
+      if (!isLong && liq >= spot) ok++;
+      total++;
+      if (total >= 5000) break;
+    }
+    return { ok, total, ratio: total ? ok / total : 0 };
+  };
+  const a = score(false);
+  const b = score(true);
+  return b.ratio > a.ratio;
+}
+
+async function main() {
+  const connection = new Connection(RPC, "confirmed");
+
+  const posDisc = discriminator("Position");
+  const filters = [{ memcmp: { offset: 0, bytes: bs58.encode(posDisc) } }];
+  if (!DISABLE_CUSTODY_FILTER) {
+    filters.push({ memcmp: { offset: 72, bytes: SOL_CUSTODY.toBase58() } });
+  }
+
+  const accounts = await connection.getProgramAccounts(PROGRAM_ID, {
+    dataSlice: { offset: 0, length: RECORD_LEN },
+    filters,
+  });
+  console.log(`🔎 命中 Position 账户：${accounts.length} 个`);
+
+  const spot = await fetchSpot().catch(() => 190.0);
+  console.log(`💱 Spot≈${spot.toFixed(2)} (Binance)`);
+
+  const samples = [];
+  for (const { account } of accounts.slice(0, 50000)) {
+    const d = account.data;
+    if (!d || d.length < RECORD_LEN) continue;
+    const entry = U64(d, OFF.price) / USD_PREC;
+    const sizeUsd = U64(d, OFF.sizeUsd) / USD_PREC;
+    const collUsd = U64(d, OFF.collateralUsd) / USD_PREC;
+    if (!(entry > 0) || !(sizeUsd > 0)) continue;
+    samples.push({ sideByte: d[OFF.side] ?? 0, entry, sizeUsd, collUsd });
+    if (samples.length >= 10000) break;
+  }
+
+  let LONG_IS_ONE;
+  if (FORCE_LONG_IS_ONE === "0" || FORCE_LONG_IS_ONE === "1") {
+    LONG_IS_ONE = FORCE_LONG_IS_ONE === "1";
+    console.log(`🧭 Side 强制映射：${LONG_IS_ONE ? "1=long, 0=short" : "0=long, 1=short"}`);
+  } else {
+    LONG_IS_ONE = autodetectWithSpot(samples, spot);
+    console.log(`🧭 Side 映射自动判定：${LONG_IS_ONE ? "1=long, 0=short" : "0=long, 1=short"}`);
+  }
+
+  const exportOnce = (longIsOne) => {
+    let csv = "liq_price,size_sol\n";
+    let written = 0, skippedInvalid = 0, skippedBadLiq = 0;
+
+    for (const { account } of accounts) {
+      const d = account.data;
+      if (!d || d.length < RECORD_LEN) { skippedInvalid++; continue; }
+
+      const sideByte = d[OFF.side] ?? 0;
+      const isLong = longIsOne ? (sideByte === 1) : (sideByte === 0);
+      const entry = U64(d, OFF.price) / USD_PREC;
+      const sizeUsd = U64(d, OFF.sizeUsd) / USD_PREC;
+      const collUsd = U64(d, OFF.collateralUsd) / USD_PREC;
+      if (!(entry > 0) || !(sizeUsd > 0)) { skippedInvalid++; continue; }
+
+      const liq = calcLiq({ isLong, entry, sizeUsd, collUsd });
+      if (!Number.isFinite(liq) || liq <= 0) { skippedBadLiq++; continue; }
+
+      const sizeSol = sizeUsd / entry;
+      csv += `${liq.toFixed(6)},${sizeSol.toFixed(4)}\n`;
+
+      written++;
+      if (LIMIT > 0 && written >= LIMIT) break;
+    }
+
+    return { csv, written, skippedInvalid, skippedBadLiq };
+  };
+
+  let res = exportOnce(LONG_IS_ONE);
+  if (res.written >= 1000 && res.written > 0 && (res.csv.match(/long/g)?.length === 0 || res.csv.match(/short/g)?.length === 0)) {
+    const alt = exportOnce(!LONG_IS_ONE);
+    if (alt.written > res.written) res = alt;
+  }
+
+  const dir = "data-sol_snapshots";
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+
+  const nowUtc = new Date().toISOString().replace(/[-:]/g, "").slice(0, 13); // e.g. 20250812T1009
+  const filename = `sol_positions_${nowUtc}Z.csv`;
+  const filepath = `${dir}/${filename}`;
+
+  fs.writeFileSync(filepath, res.csv);
+  console.log(`✅ 导出完成：${filepath} | 写入行: ${res.written} / 命中账户: ${accounts.length}`);
+
+  
+  if (res.skippedInvalid || res.skippedBadLiq) {
+    console.log(`   ↳ 跳过：无效/缺字段 ${res.skippedInvalid} 行；liq<=0 或 NaN ${res.skippedBadLiq} 行`);
+  }
+}
+
+main().catch((e) => {
+  console.error("❌ 运行出错：", e);
+  process.exit(1);
+});
