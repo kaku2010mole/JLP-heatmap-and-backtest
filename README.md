@@ -19,19 +19,53 @@ RPC used here is my private free node. We can change it to company's RPC for mor
 
 python3 timeseries_liq_heatmap.py \
   --folder data-sol_snapshots \
-  --hours 72 \
   --bin 0.1 \
   --pmin 170 \
-  --pmax 220 \
-  --out heatmap_1min.png
+  --pmax 200 \
+  --t-start 2025-08-22T12:00:00 \
+  --t-end 2025-08-22T15:00:00 \
+  --out heatmap_0822_12_15.png \
+  --log-color \
+  --vmin 100 \
+  --vmax 10000
 
 
 Factors here can be adjusted. 
 
---hours: how many hours back from now the heatmap spans (it begins at now − hours).
+--t-start and --t-end: when did the heatmap began to show and when did it ends.
 
 --pmin / --pmax: lower and upper bounds of the price axis.
 
+--vmin / --vmax: lightest / deepest color for liquidation SOL amout
 
+3. Use this file for backtesting
+
+test heatmap.py
+
+# The absolute adjustment percentage to apply when a boost is triggered.
+# For example, a value of 0.5 means a ±50% change to the current ratio depending on direction.
+boost_pct_abs = 0.5
+
+# Boosting is triggered when either the upper or lower accumulated SOL liquidation volume exceeds 200.
+# This serves as a threshold to determine whether there's significant liquidation pressure.
+trigger = (sol_sum_upper > 200 or sol_sum_lower > 200)
+
+# Start applying boost logic only if:
+# - it hasn't already been applied, and
+# - a sufficient number of confirmation intervals (confirm >= 1) have passed since the trigger condition.
+if not boost_applied and confirm >= 1:
+    boost_applied = True
+    # Determine direction of the boost:
+    #   +1 if lower liquidation pressure is stronger (buy side support),
+    #   -1 if upper liquidation pressure is stronger (sell side resistance).
+    direction = 1 if sol_sum_lower > sol_sum_upper else -1
+    boost_toggle_points.append((df["timestamp"].iloc[i], "on"))
+
+# Stop applying boost if enough "release" confirmations (release >= 5) have accumulated
+# indicating that the pressure has eased or normalized.
+if boost_applied and release >= 5:
+    boost_applied = False
+    direction = 0  # Neutralize adjustment
+    boost_toggle_points.append((df["timestamp"].iloc[i], "off"))
 
 Notes: This is already a sol_positions_log.csv file in data-sol_snapshots for reference.
